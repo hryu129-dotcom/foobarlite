@@ -1,16 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Foobar Lite Mobile  -  安卓版音乐搜索 / 下载器 (Kivy)
-
-只做在线搜索 + 多链路下载,不含 Windows 专属功能
-(声卡清单 / 驱动安装 / 输出设备切换 —— 这些手机上物理上不存在)。
-
-界面:
-  搜索页   输入关键词 -> 并发搜索多音源 -> 按歌曲聚合,展开可见各音源链路
-  下载页   任务队列 / 实时进度 / 保存目录
-  设置页   自定义解析接口(扩展下载链路),保存位置
-
-依赖: kivy, requests, certifi
+Foobar Lite Mobile  -  安卓版音乐播放器 (Kivy)
+功能：本地扫描、在线搜索、试听播放、下载、播放历史、播放列表
 """
 
 import os
@@ -18,12 +9,12 @@ import sys
 import json
 import time
 import threading
+import random
 
-# 修复安卓上中文乱码问题 - 在导入kivy之前设置默认字体
+# 修复安卓上中文乱码问题
 from kivy.config import Config
 from kivy.utils import platform
 
-# 安卓上使用系统中文字体
 if platform == "android":
     cn_fonts = [
         "/system/fonts/NotoSansCJK-Regular.ttc",
@@ -49,23 +40,24 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.progressbar import ProgressBar
+from kivy.core.audio import SoundLoader
 
 import music_sources as ms
 
 IS_ANDROID = (platform == "android")
 
-# 配色(foobar2000 风格深色)
+# 配色
 BG = (0.118, 0.122, 0.133, 1)
 PANEL = (0.165, 0.173, 0.188, 1)
 FG = (0.84, 0.85, 0.87, 1)
 ACCENT = (0.184, 0.435, 0.749, 1)
 OK_COLOR = (0.47, 0.86, 0.55, 1)
 BAD_COLOR = (0.86, 0.51, 0.51, 1)
+GRAY = (0.6, 0.62, 0.66, 1)
+
+AUDIO_EXTS = ('.mp3', '.flac', '.wav', '.ape', '.ogg', '.m4a', '.aac', '.wma', '.opus')
 
 
-# =====================================================================
-#  工具
-# =====================================================================
 def get_settings_path():
     base = App.get_running_app().user_data_dir if App.get_running_app() else os.getcwd()
     return os.path.join(base, "settings.json")
@@ -76,7 +68,7 @@ def load_settings():
         with open(get_settings_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"custom_apis": []}
+        return {"custom_apis": [], "history": [], "playlist": []}
 
 
 def save_settings(data):
@@ -88,33 +80,7 @@ def save_settings(data):
         return False
 
 
-def get_download_dir():
-    """选一个可写的下载目录。安卓上优先公共音乐目录(用户能找到),
-    被沙箱拦下就退回应用私有目录,并把真实路径显示在界面上。"""
-    if IS_ANDROID:
-        candidates = ["/storage/emulated/0/Music/FoobarLite",
-                      "/sdcard/Music/FoobarLite"]
-        for c in candidates:
-            try:
-                os.makedirs(c, exist_ok=True)
-                probe = os.path.join(c, ".w")
-                with open(probe, "w") as f:
-                    f.write("1")
-                os.remove(probe)
-                return c
-            except Exception:
-                continue
-    base = App.get_running_app().user_data_dir if App.get_running_app() else os.path.expanduser("~")
-    d = os.path.join(base, "downloads")
-    try:
-        os.makedirs(d, exist_ok=True)
-    except Exception:
-        pass
-    return d
-
-
 def request_android_permissions():
-    """安卓上请求存储权限(写公共目录需要)"""
     if not IS_ANDROID:
         return
     try:
@@ -126,7 +92,6 @@ def request_android_permissions():
 
 
 def toast(text):
-    """轻量提示(Popup,安卓上没有原生 toast 也能用)"""
     content = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
     content.add_widget(Label(text=str(text), color=FG, halign="center"))
     p = Popup(title="提示", content=content, size_hint=(0.86, 0.34),
@@ -140,142 +105,66 @@ def toast(text):
 
 
 # =====================================================================
-#  下载任务
+#  本地文件扫描线程
 # =====================================================================
-class DownloadTask(object):
-    def __init__(self, song, cand, filename):
-        self.song = song
-        self.cand = cand
-        self.filename = filename
-        self.percent = 0
-        self.status = "等待中"
-        self.path = ""
-
-
-class TaskRow(BoxLayout):
-    """下载页里的一行:文件名 + 进度条 + 状态"""
-
-    def __init__(self, task, **kw):
-        super(TaskRow, self).__init__(orientation="vertical", size_hint_y=None,
-                                      height=dp(64), padding=(dp(8), dp(4)),
-                                      spacing=dp(2), **kw)
-        self.task = task
-        row = BoxLayout(size_hint_y=None, height=dp(24))
-        self.name_lbl = Label(text=task.filename, color=FG, halign="left",
-                              valign="middle", shorten=True, shorten_from="right",
-                              font_size=dp(13))
-        self.name_lbl.bind(size=self.name_lbl.setter("text_size"))
-        row.add_widget(self.name_lbl)
-        row.add_widget(Label(text=task.cand.get("label", ""), color=(0.55, 0.57, 0.6, 1),
-                             size_hint_x=0.42, font_size=dp(11),
-                             shorten=True, shorten_from="right"))
-        self.add_widget(row)
-        self.bar = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(12))
-        self.add_widget(self.bar)
-        self.state_lbl = Label(text=task.status, color=(0.6, 0.62, 0.66, 1),
-                               size_hint_y=None, height=dp(18), font_size=dp(11),
-                               halign="left", valign="middle")
-        self.state_lbl.bind(size=self.state_lbl.setter("text_size"))
-        self.add_widget(self.state_lbl)
-
-    def refresh(self):
-        self.bar.value = self.task.percent
-        self.state_lbl.text = self.task.status
-        if self.task.status.startswith("完成"):
-            self.state_lbl.color = OK_COLOR
-        elif self.task.status.startswith("失败"):
-            self.state_lbl.color = BAD_COLOR
-        else:
-            self.state_lbl.color = (0.6, 0.62, 0.66, 1)
-
-
-# =====================================================================
-#  下载引擎(线程 + 回调到 UI 线程)
-# =====================================================================
-class Downloader(object):
-    def __init__(self, app):
+class ScanThread(threading.Thread):
+    def __init__(self, app, root_dir="/storage/emulated/0"):
+        super().__init__()
         self.app = app
-        self.stop_flag = False
-        self.running = False
-
-    def start(self, tasks, folder):
-        if self.running:
-            toast("已有下载在进行中")
-            return
-        self.stop_flag = False
+        self.root_dir = root_dir
         self.running = True
-        t = threading.Thread(target=self._run, args=(tasks, folder))
-        t.daemon = True
-        t.start()
 
-    def _run(self, tasks, folder):
-        ok = fail = 0
-        for task in tasks:
-            if self.stop_flag:
+    def run(self):
+        files = []
+        skip_dirs = {'Android', '.git', 'DCIM', 'Movies', 'WhatsApp'}
+
+        for root, dirs, filenames in os.walk(self.root_dir):
+            if not self.running:
                 break
-            try:
-                self._one(task, folder)
-                ok += 1
-            except Exception as e:
-                task.status = "失败: {}".format(type(e).__name__)
-                Clock.schedule_once(lambda dt, t=task: self.app.update_task(t), 0)
-                fail += 1
-        self.running = False
-        Clock.schedule_once(lambda dt: self.app.on_downloads_done(ok, fail), 0)
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in skip_dirs]
+            for f in filenames:
+                if f.lower().endswith(AUDIO_EXTS):
+                    files.append(os.path.join(root, f))
+                    if len(files) % 20 == 0:
+                        Clock.schedule_once(lambda dt, c=len(files): self.app.scan_progress(c), 0)
 
-    def _one(self, task, folder):
-        url = task.cand["url"]
-        target = os.path.join(folder, task.filename)
-        tmp = target + ".part"
-        task.status = "下载中"
-        Clock.schedule_once(lambda dt, t=task: self.app.update_task(t), 0)
-        r = ms.http_get(url, timeout=25, stream=True)
-        try:
-            if r.status_code >= 400:
-                raise RuntimeError("HTTP {}".format(r.status_code))
-            total = int(r.headers.get("Content-Length") or 0)
-            got = 0
-            last = 0
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    if self.stop_flag:
-                        break
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    got += len(chunk)
-                    now = time.time()
-                    if total and now - last > 0.25:
-                        last = now
-                        task.percent = int(got * 100 / total)
-                        Clock.schedule_once(lambda dt, t=task: self.app.update_task(t), 0)
-            if self.stop_flag:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-                task.status = "已取消"
-                Clock.schedule_once(lambda dt, t=task: self.app.update_task(t), 0)
-                return
-            os.replace(tmp, target)
-            task.percent = 100
-            task.path = target
-            task.status = "完成 · {}".format(ms.human_size(got if not total else total))
-            Clock.schedule_once(lambda dt, t=task: self.app.update_task(t), 0)
-        finally:
-            try:
-                r.close()
-            except Exception:
-                pass
+        Clock.schedule_once(lambda dt: self.app.scan_finished(files), 0)
 
 
 # =====================================================================
-#  搜索结果:一首歌(含多条音源链路)
+#  本地歌曲列表项
+# =====================================================================
+class LocalSongRow(BoxLayout):
+    def __init__(self, filepath, app, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None,
+                         height=dp(56), padding=(dp(8), dp(4)), spacing=dp(6), **kw)
+        self.filepath = filepath
+        self.app = app
+        filename = os.path.basename(filepath)
+        name, ext = os.path.splitext(filename)
+
+        self.name_lbl = Label(text=name, color=FG, halign="left", valign="middle",
+                              shorten=True, shorten_from="right", font_size=dp(13))
+        self.name_lbl.bind(size=self.name_lbl.setter("text_size"))
+        self.add_widget(self.name_lbl)
+
+        self.ext_lbl = Label(text=ext.lstrip('.').upper(), color=GRAY,
+                             size_hint_x=0.18, font_size=dp(10), valign="middle")
+        self.add_widget(self.ext_lbl)
+
+        play_btn = Button(text="▶", size_hint_x=0.15, background_normal="",
+                          background_color=ACCENT, font_size=dp(14))
+        play_btn.bind(on_release=lambda *_: self.app.play_local_file(filepath))
+        self.add_widget(play_btn)
+
+
+# =====================================================================
+#  搜索结果行
 # =====================================================================
 class SongGroup(BoxLayout):
     def __init__(self, group, app, **kw):
-        super(SongGroup, self).__init__(orientation="vertical", size_hint_y=None,
-                                        spacing=dp(2), padding=(dp(6), dp(3)), **kw)
+        super().__init__(orientation="vertical", size_hint_y=None,
+                         spacing=dp(2), padding=(dp(6), dp(3)), **kw)
         self.group = group
         self.app = app
         self.expanded = False
@@ -317,7 +206,7 @@ class SongGroup(BoxLayout):
             row.add_widget(dl)
             play = Button(text="试听", size_hint_x=0.24, background_normal="",
                           background_color=(0.28, 0.30, 0.34, 1), font_size=dp(12))
-            play.bind(on_release=lambda *_, s=v: self.app.preview_song(s))
+            play.bind(on_release=lambda *_, s=v: self.app.preview_online(s))
             row.add_widget(play)
             row.add_widget(Label(text="", size_hint_x=0.2, font_size=dp(11)))
             self.variant_box.add_widget(row)
@@ -330,17 +219,49 @@ class SongGroup(BoxLayout):
 class RootUI(TabbedPanel):
     def __init__(self, app, **kw):
         super(RootUI, self).__init__(do_default_tab=False,
-                                     tab_pos="top_mid", tab_width=dp(110),
+                                     tab_pos="top_mid", tab_width=dp(90),
                                      **kw)
         self.app = app
         self.tab_bg = BG
+        self.build_local_tab()
         self.build_search_tab()
-        self.build_download_tab()
+        self.build_history_tab()
         self.build_settings_tab()
 
-    # ---------------- 搜索页 ----------------
+    # ---------------- 本地音乐页 ----------------
+    def build_local_tab(self):
+        tab = TabbedPanelItem(text="本地音乐")
+        box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        scan_btn = Button(text="扫描本机音频", background_normal="",
+                          background_color=ACCENT, font_size=dp(14))
+        scan_btn.bind(on_release=lambda *_: self.app.scan_local())
+        row.add_widget(scan_btn)
+        clear_btn = Button(text="清空列表", background_normal="",
+                           background_color=(0.28, 0.30, 0.34, 1), font_size=dp(13))
+        clear_btn.bind(on_release=lambda *_: self.app.clear_local_list())
+        row.add_widget(clear_btn)
+        box.add_widget(row)
+
+        self.scan_status = Label(text="点击扫描本机音频文件", color=GRAY,
+                                  size_hint_y=None, height=dp(22), font_size=dp(11),
+                                  halign="left", valign="middle")
+        self.scan_status.bind(size=self.scan_status.setter("text_size"))
+        box.add_widget(self.scan_status)
+
+        sv = ScrollView()
+        self.local_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(2))
+        self.local_box.bind(minimum_height=self.local_box.setter("height"))
+        sv.add_widget(self.local_box)
+        box.add_widget(sv)
+
+        tab.add_widget(box)
+        self.add_widget(tab)
+
+    # ---------------- 在线搜索页 ----------------
     def build_search_tab(self):
-        tab = TabbedPanelItem(text="搜索")
+        tab = TabbedPanelItem(text="在线搜索")
         box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
 
         row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
@@ -356,20 +277,19 @@ class RootUI(TabbedPanel):
         row.add_widget(self.src_spinner)
         box.add_widget(row)
 
-        go = Button(text="搜索(多音源并发)", size_hint_y=None, height=dp(46),
+        go = Button(text="搜索", size_hint_y=None, height=dp(46),
                     background_normal="", background_color=ACCENT, font_size=dp(14))
         go.bind(on_release=lambda *_: self.app.do_search())
         box.add_widget(go)
 
-        self.status_lbl = Label(text="输入关键词后点搜索", color=(0.6, 0.62, 0.66, 1),
+        self.status_lbl = Label(text="输入关键词后点搜索", color=GRAY,
                                 size_hint_y=None, height=dp(22), font_size=dp(11),
                                 halign="left", valign="middle")
         self.status_lbl.bind(size=self.status_lbl.setter("text_size"))
         box.add_widget(self.status_lbl)
 
         sv = ScrollView()
-        self.results_box = BoxLayout(orientation="vertical", size_hint_y=None,
-                                     spacing=dp(4))
+        self.results_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
         self.results_box.bind(minimum_height=self.results_box.setter("height"))
         sv.add_widget(self.results_box)
         box.add_widget(sv)
@@ -377,42 +297,20 @@ class RootUI(TabbedPanel):
         tab.add_widget(box)
         self.add_widget(tab)
 
-    # ---------------- 下载页 ----------------
-    def build_download_tab(self):
-        tab = TabbedPanelItem(text="下载")
+    # ---------------- 播放历史页 ----------------
+    def build_history_tab(self):
+        tab = TabbedPanelItem(text="播放历史")
         box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
 
-        self.dir_lbl = Label(text="保存目录: " + self.app.download_dir,
-                             color=(0.6, 0.62, 0.66, 1), size_hint_y=None,
-                             height=dp(40), font_size=dp(11), halign="left",
-                             valign="middle", shorten=True, shorten_from="right")
-        self.dir_lbl.bind(size=self.dir_lbl.setter("text_size"))
-        box.add_widget(self.dir_lbl)
-
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        b1 = Button(text="开始全部", background_normal="", background_color=ACCENT,
-                    font_size=dp(13))
-        b1.bind(on_release=lambda *_: self.app.start_downloads())
-        b2 = Button(text="停止", background_normal="",
-                    background_color=(0.28, 0.30, 0.34, 1), font_size=dp(13))
-        b2.bind(on_release=lambda *_: self.app.stop_downloads())
-        b3 = Button(text="清空", background_normal="",
-                    background_color=(0.28, 0.30, 0.34, 1), font_size=dp(13))
-        b3.bind(on_release=lambda *_: self.app.clear_tasks())
-        for b in (b1, b2, b3):
-            row.add_widget(b)
-        box.add_widget(row)
-
-        self.dl_summary = Label(text="", color=(0.6, 0.62, 0.66, 1), size_hint_y=None,
-                                height=dp(22), font_size=dp(11), halign="left")
-        self.dl_summary.bind(size=self.dl_summary.setter("text_size"))
-        box.add_widget(self.dl_summary)
+        self.history_count = Label(text="播放历史 (0)", color=GRAY,
+                                   size_hint_y=None, height=dp(24), font_size=dp(12),
+                                   halign="left")
+        box.add_widget(self.history_count)
 
         sv = ScrollView()
-        self.tasks_box = BoxLayout(orientation="vertical", size_hint_y=None,
-                                   spacing=dp(2))
-        self.tasks_box.bind(minimum_height=self.tasks_box.setter("height"))
-        sv.add_widget(self.tasks_box)
+        self.history_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(2))
+        self.history_box.bind(minimum_height=self.history_box.setter("height"))
+        sv.add_widget(self.history_box)
         box.add_widget(sv)
 
         tab.add_widget(box)
@@ -423,29 +321,26 @@ class RootUI(TabbedPanel):
         tab = TabbedPanelItem(text="设置")
         box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
 
+        box.add_widget(Label(text="支持格式: MP3/FLAC/WAV/APE/OGG/M4A/AAC/WMA/OPUS",
+                             color=(0.55, 0.72, 1, 1), size_hint_y=None,
+                             height=dp(24), font_size=dp(12), halign="left"))
+
         box.add_widget(Label(text="自定义解析接口(每行一个,扩展下载链路)",
                              color=(0.55, 0.72, 1, 1), size_hint_y=None,
                              height=dp(24), font_size=dp(12), halign="left"))
         box.add_widget(Label(
-            text="格式:方法|名称|URL模板\n"
-                 "方法 text = 请求后自动提取直链,direct = 模板本身即直链\n"
-                 "占位符 {id} {mid} {hash} {keyword} {name}\n"
-                 "例: text|我的接口|http://api/?id={id}",
-            color=(0.6, 0.62, 0.66, 1), size_hint_y=None, height=dp(76),
-            font_size=dp(11), halign="left"))
+            text="格式:方法|名称|URL模板\n方法 text = 请求后自动提取直链, direct = 模板本身即直链\n例: text|我的接口|http://api/?id={id}",
+            color=GRAY, size_hint_y=None, height=dp(60), font_size=dp(11), halign="left"))
         self.api_input = TextInput(text="", multiline=True, background_color=PANEL,
-                                   foreground_color=FG, cursor_color=ACCENT,
-                                   font_size=dp(12))
+                                   foreground_color=FG, cursor_color=ACCENT, font_size=dp(12))
         box.add_widget(self.api_input)
 
         save = Button(text="保存设置", size_hint_y=None, height=dp(44),
                       background_normal="", background_color=ACCENT)
         save.bind(on_release=lambda *_: self.app.save_custom_apis())
         box.add_widget(save)
-        box.add_widget(Label(text="保存目录:" + self.app.download_dir,
-                             color=(0.6, 0.62, 0.66, 1), size_hint_y=None,
-                             height=dp(40), font_size=dp(11), shorten=True))
-        box.add_widget(Label(text="Foobar Lite Mobile v{}   (仅在线搜索 + 下载)".format(ms.APP_VER),
+
+        box.add_widget(Label(text="Foobar Lite Mobile v1.1",
                              color=(0.45, 0.47, 0.5, 1), size_hint_y=None,
                              height=dp(30), font_size=dp(11)))
         tab.add_widget(box)
@@ -453,24 +348,74 @@ class RootUI(TabbedPanel):
 
 
 # =====================================================================
+#  底部播放控制栏
+# =====================================================================
+class PlayerBar(BoxLayout):
+    def __init__(self, app, **kw):
+        super().__init__(orientation="horizontal", size_hint_y=None, height=dp(70),
+                         padding=(dp(8), dp(4)), spacing=dp(6), **kw)
+        self.app = app
+        self.background_color = PANEL
+
+        self.prev_btn = Button(text="⏮", size_hint_x=0.12, background_normal="",
+                               background_color=PANEL, font_size=dp(16))
+        self.prev_btn.bind(on_release=lambda *_: app.play_prev())
+        self.add_widget(self.prev_btn)
+
+        self.play_btn = Button(text="▶", size_hint_x=0.14, background_normal="",
+                               background_color=ACCENT, font_size=dp(18))
+        self.play_btn.bind(on_release=lambda *_: app.toggle_play())
+        self.add_widget(self.play_btn)
+
+        self.next_btn = Button(text="⏭", size_hint_x=0.12, background_normal="",
+                               background_color=PANEL, font_size=dp(16))
+        self.next_btn.bind(on_release=lambda *_: app.play_next())
+        self.add_widget(self.next_btn)
+
+        info_box = BoxLayout(orientation="vertical", size_hint_x=0.62)
+        self.song_name = Label(text="未播放", color=FG, halign="left",
+                               valign="middle", shorten=True, shorten_from="right",
+                               font_size=dp(13))
+        self.song_name.bind(size=self.song_name.setter("text_size"))
+        info_box.add_widget(self.song_name)
+
+        self.progress_slider = Slider(min=0, max=100, value=0, size_hint_y=None, height=dp(16))
+        self.progress_slider.bind(on_touch_up=lambda inst, touch: app.seek(inst.value) if inst.collide_point(*touch.pos) else None)
+        info_box.add_widget(self.progress_slider)
+        self.add_widget(info_box)
+
+
+# =====================================================================
 #  App
 # =====================================================================
 class MobileApp(App):
-    title = "Foobar Lite Mobile"
-    name = "foobarlite"          # 显式命名,保证 user_data_dir 位置可预期
+    title = "Foobar Lite"
+    name = "foobarlite"
 
     def build(self):
         self.settings = load_settings()
-        self.download_dir = get_download_dir()
-        self.downloader = Downloader(self)
-        self.task_rows = []
-        self.tasks = []
-        self.playing = None
+        self.local_files = []
+        self.current_index = -1
+        self.play_mode = 0
+        self.loop_modes = ["列表循环", "单曲循环", "随机播放"]
+        self.player = None
+        self.playing_file = None
+
         if IS_ANDROID:
             Clock.schedule_once(lambda dt: request_android_permissions(), 1)
+
+        root = BoxLayout(orientation="vertical")
         self.root_ui = RootUI(self)
+        root.add_widget(self.root_ui)
+        self.player_bar = PlayerBar(self)
+        root.add_widget(self.player_bar)
+
         Clock.schedule_once(lambda dt: self._load_apis_into_ui(), 0)
-        return self.root_ui
+        Clock.schedule_once(lambda dt: self.load_history_ui(), 0)
+
+        self.timer = Clock.schedule_interval(self.update_progress, 0.5)
+
+        return root
 
     def _load_apis_into_ui(self):
         lines = []
@@ -479,26 +424,129 @@ class MobileApp(App):
                                            a.get("name", ""), a.get("url", "")))
         self.root_ui.api_input.text = "\n".join(lines)
 
-    # ---------------- 自定义接口 ----------------
-    def save_custom_apis(self):
-        apis = []
-        for line in (self.root_ui.api_input.text or "").splitlines():
-            line = line.strip()
-            if not line or line.count("|") < 2:
-                continue
-            parts = line.split("|")
-            method = parts[0].strip().lower()
-            if method not in ("text", "direct"):
-                method = "text"
-            apis.append({"method": method, "name": parts[1].strip(),
-                         "url": "|".join(parts[2:]).strip()})
-        self.settings["custom_apis"] = apis
-        if save_settings(self.settings):
-            toast("已保存 {} 个自定义接口".format(len(apis)))
-        else:
-            toast("保存失败")
+    # ---------------- 本地扫描 ----------------
+    def scan_local(self):
+        self.root_ui.scan_status.text = "正在扫描..."
+        self.scan_thread = ScanThread(self)
+        self.scan_thread.start()
 
-    # ---------------- 搜索 ----------------
+    def scan_progress(self, count):
+        self.root_ui.scan_status.text = "已找到 {} 个音频文件...".format(count)
+
+    def scan_finished(self, files):
+        self.local_files = files
+        self.root_ui.scan_status.text = "扫描完成，共 {} 首音频".format(len(files))
+        self.root_ui.local_box.clear_widgets()
+        for f in files:
+            self.root_ui.local_box.add_widget(LocalSongRow(f, self))
+        toast("扫描完成，共 {} 首".format(len(files)))
+
+    def clear_local_list(self):
+        self.local_files = []
+        self.root_ui.local_box.clear_widgets()
+        self.root_ui.scan_status.text = "列表已清空"
+
+    # ---------------- 播放控制 ----------------
+    def play_local_file(self, filepath):
+        self.stop_player()
+        self.player = SoundLoader.load(filepath)
+        if self.player is None:
+            toast("无法播放该格式: " + os.path.splitext(filepath)[1])
+            return
+        self.player.play()
+        self.playing_file = filepath
+        self.player_bar.play_btn.text = "⏸"
+        self.player_bar.song_name.text = os.path.basename(filepath)
+        self.current_index = self.local_files.index(filepath) if filepath in self.local_files else -1
+        self.add_history(filepath)
+        self.player.bind(on_stop=lambda x: self.on_song_end())
+
+    def toggle_play(self):
+        if self.player is None:
+            if self.local_files:
+                self.play_local_file(self.local_files[0])
+            return
+        if self.player.state == "play":
+            self.player.stop()
+            self.player_bar.play_btn.text = "▶"
+        else:
+            self.player.play()
+            self.player_bar.play_btn.text = "⏸"
+
+    def stop_player(self):
+        if self.player:
+            try:
+                self.player.stop()
+            except:
+                pass
+        self.player_bar.play_btn.text = "▶"
+
+    def play_prev(self):
+        if not self.local_files:
+            return
+        if self.current_index <= 0:
+            idx = len(self.local_files) - 1
+        else:
+            idx = self.current_index - 1
+        self.play_local_file(self.local_files[idx])
+
+    def play_next(self):
+        if not self.local_files:
+            return
+        if self.play_mode == 2:
+            idx = random.randint(0, len(self.local_files) - 1)
+        elif self.current_index >= len(self.local_files) - 1:
+            idx = 0
+        else:
+            idx = self.current_index + 1
+        self.play_local_file(self.local_files[idx])
+
+    def on_song_end(self):
+        if self.play_mode == 1:
+            if self.playing_file:
+                self.play_local_file(self.playing_file)
+        else:
+            self.play_next()
+
+    def seek(self, value):
+        if self.player and self.player.length:
+            self.player.seek(self.player.length * value / 100)
+
+    def update_progress(self, dt):
+        if self.player and self.player.length:
+            pos = self.player.get_pos()
+            self.player_bar.progress_slider.value = int(pos * 100 / self.player.length)
+
+    # ---------------- 播放历史 ----------------
+    def add_history(self, filepath):
+        history = self.settings.get("history", [])
+        if filepath in history:
+            history.remove(filepath)
+        history.insert(0, filepath)
+        history = history[:100]
+        self.settings["history"] = history
+        save_settings(self.settings)
+        self.load_history_ui()
+
+    def load_history_ui(self):
+        history = self.settings.get("history", [])
+        self.root_ui.history_count.text = "播放历史 ({})".format(len(history))
+        self.root_ui.history_box.clear_widgets()
+        for fp in reversed(history[:50]):
+            row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6),
+                            padding=(dp(8), dp(4)))
+            name_lbl = Label(text=os.path.basename(fp), color=FG, halign="left",
+                             valign="middle", shorten=True, shorten_from="right",
+                             font_size=dp(12))
+            name_lbl.bind(size=name_lbl.setter("text_size"))
+            row.add_widget(name_lbl)
+            play_btn = Button(text="▶", size_hint_x=0.15, background_normal="",
+                              background_color=ACCENT, font_size=dp(13))
+            play_btn.bind(on_release=lambda *_, f=fp: self.play_local_file(f))
+            row.add_widget(play_btn)
+            self.root_ui.history_box.add_widget(row)
+
+    # ---------------- 在线搜索 ----------------
     def do_search(self):
         kw = (self.root_ui.kw_input.text or "").strip()
         if not kw:
@@ -532,80 +580,17 @@ class MobileApp(App):
         box = self.root_ui.results_box
         box.clear_widgets()
         if not groups:
-            box.add_widget(Label(text="没有找到结果", color=(0.6, 0.62, 0.66, 1),
+            box.add_widget(Label(text="没有找到结果", color=GRAY,
                                  size_hint_y=None, height=dp(40)))
             self.root_ui.status_lbl.text = "没有找到结果"
             return
         for g in groups:
             box.add_widget(SongGroup(g, self))
-        self.root_ui.status_lbl.text = "共 {} 首(点一下展开各音源链路)".format(len(groups))
+        self.root_ui.status_lbl.text = "共 {} 首(点一下展开各音源)".format(len(groups))
 
-    # ---------------- 队列 / 下载 ----------------
-    def queue_song(self, song):
-        """解析该音源的多条链路,挑第一条可用直链入队"""
-        if song["source"] == "migu" and not song.get("sid"):
-            toast("该音源无有效 ID")
-            return
-        toast("正在解析链路...")
-
-        def work():
-            cands = ms.resolve_song(song, self.settings.get("custom_apis"))
-            best = ms.best_direct(cands)
-            Clock.schedule_once(lambda dt: self._queued(song, cands, best), 0)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _queued(self, song, cands, best):
-        if not best:
-            good = [c for c in cands if c.get("kind") == "web"]
-            msg = "没有可用的直链(可能需会员或接口受限)"
-            if good:
-                msg += "\n可复制链接到浏览器:\n" + good[0]["url"]
-            toast(msg)
-            return
-        ext = ms.guess_ext(best["url"], best.get("quality", ""))
-        fn = "{}_{}{}".format(ms.safe_filename(song.get("name", "")),
-                              ms.safe_filename(song.get("artist", "")), ext)
-        task = DownloadTask(song, best, fn)
-        self.tasks.append(task)
-        row = TaskRow(task)
-        self.task_rows.append(row)
-        self.root_ui.tasks_box.add_widget(row)
-        toast("已加入下载队列:{}".format(fn))
-        self.root_ui.dl_summary.text = "队列 {} 项".format(len(self.tasks))
-
-    def update_task(self, task):
-        for row in self.task_rows:
-            if row.task is task:
-                row.refresh()
-                break
-
-    def start_downloads(self):
-        if not self.tasks:
-            toast("下载队列为空")
-            return
-        self.downloader.start(list(self.tasks), self.download_dir)
-
-    def stop_downloads(self):
-        self.downloader.stop_flag = True
-        toast("正在停止...")
-
-    def clear_tasks(self):
-        if self.downloader.running:
-            toast("请先停止下载")
-            return
-        self.tasks = []
-        self.task_rows = []
-        self.root_ui.tasks_box.clear_widgets()
-        self.root_ui.dl_summary.text = ""
-
-    def on_downloads_done(self, ok, fail):
-        self.root_ui.dl_summary.text = "完成 {} 个 / 失败 {} 个".format(ok, fail)
-        toast("下载结束:成功 {} / 失败 {}".format(ok, fail))
-
-    # ---------------- 试听(实验) ----------------
-    def preview_song(self, song):
-        toast("正在准备试听...")
+    # ---------------- 在线试听 ----------------
+    def preview_online(self, song):
+        toast("正在解析试听链接...")
 
         def work():
             cands = ms.resolve_song(song, self.settings.get("custom_apis"))
@@ -614,7 +599,6 @@ class MobileApp(App):
                 Clock.schedule_once(lambda dt: toast("没有可试听的直链"), 0)
                 return
             try:
-                from kivy.core.audio import SoundLoader
                 ext = ms.guess_ext(best["url"], best.get("quality", ""))
                 tmp = os.path.join(self.user_data_dir, "preview" + ext)
                 if not os.path.exists(tmp):
@@ -626,23 +610,64 @@ class MobileApp(App):
                     r.close()
 
                 def play(dt):
-                    snd = SoundLoader.load(tmp)
-                    if snd is None:
+                    self.stop_player()
+                    self.player = SoundLoader.load(tmp)
+                    if self.player is None:
                         toast("当前平台无法试听该格式")
                         return
-                    if self.playing is not None:
-                        try:
-                            self.playing.stop()
-                        except Exception:
-                            pass
-                    self.playing = snd
-                    snd.play()
-                    toast("正在试听:{}".format(song.get("name", "")))
+                    self.player.play()
+                    self.player_bar.play_btn.text = "⏸"
+                    self.player_bar.song_name.text = "在线试听: " + song.get("name", "")
+                    toast("正在试听: " + song.get("name", ""))
+                    self.player.bind(on_stop=lambda x: setattr(self.player_bar.play_btn, 'text', '▶'))
                 Clock.schedule_once(play, 0)
             except Exception as e:
-                Clock.schedule_once(lambda dt: toast("试听失败:{}".format(type(e).__name__)), 0)
+                Clock.schedule_once(lambda dt: toast("试听失败"), 0)
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- 下载 ----------------
+    def queue_song(self, song):
+        def work():
+            cands = ms.resolve_song(song, self.settings.get("custom_apis"))
+            best = ms.best_direct(cands)
+            if not best:
+                Clock.schedule_once(lambda dt: toast("没有可用直链(可能需会员)"), 0)
+                return
+            ext = ms.guess_ext(best["url"], best.get("quality", ""))
+            fn = "{}_{}{}".format(ms.safe_filename(song.get("name", "")),
+                                  ms.safe_filename(song.get("artist", "")), ext)
+            download_dir = os.path.join(self.user_data_dir, "downloads")
+            os.makedirs(download_dir, exist_ok=True)
+            target = os.path.join(download_dir, fn)
+
+            Clock.schedule_once(lambda dt: toast("开始下载: " + fn), 0)
+            r = ms.http_get(best["url"], timeout=30, stream=True)
+            with open(target, "wb") as f:
+                for chunk in r.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
+            r.close()
+            Clock.schedule_once(lambda dt: toast("下载完成: " + fn), 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def save_custom_apis(self):
+        apis = []
+        for line in (self.root_ui.api_input.text or "").splitlines():
+            line = line.strip()
+            if not line or line.count("|") < 2:
+                continue
+            parts = line.split("|")
+            method = parts[0].strip().lower()
+            if method not in ("text", "direct"):
+                method = "text"
+            apis.append({"method": method, "name": parts[1].strip(),
+                         "url": "|".join(parts[2:]).strip()})
+        self.settings["custom_apis"] = apis
+        if save_settings(self.settings):
+            toast("已保存 {} 个自定义接口".format(len(apis)))
+        else:
+            toast("保存失败")
 
 
 if __name__ == "__main__":
