@@ -19,10 +19,26 @@ import json
 import time
 import threading
 
+# 修复安卓上中文乱码问题 - 在导入kivy之前设置默认字体
+from kivy.config import Config
+from kivy.utils import platform
+
+# 安卓上使用系统中文字体
+if platform == "android":
+    cn_fonts = [
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/system/fonts/DroidSansFallback.ttf",
+        "/system/fonts/NotoSansSC-Regular.otf",
+        "/system/fonts/SourceHanSansCN-Regular.otf",
+    ]
+    for f in cn_fonts:
+        if os.path.exists(f):
+            Config.set('kivy', 'default_font', [f, f, f, f, f])
+            break
+
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.metrics import dp
-from kivy.utils import platform
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
